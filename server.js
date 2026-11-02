@@ -16,6 +16,9 @@ const IMAGE_TYPES = {
   '.webp': 'image/webp',
 };
 
+const AUDIO_EXTENSIONS = new Set(['.mp3']);
+const COVER_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png']);
+
 // Fields offered for editing even when a picture does not have them yet.
 const COMMON_TAGS = [
   'IFD0:Make',
@@ -46,6 +49,33 @@ const COMMON_TAGS = [
   'XMP-xmp:Rating',
 ];
 
+// Same idea for audio files.
+const AUDIO_COMMON_TAGS = [
+  'ID3:Title',
+  'ID3:Artist',
+  'ID3:Album',
+  'ID3:Band',
+  'ID3:Year',
+  'ID3:Track',
+  'ID3:Genre',
+  'ID3:Comment',
+  'ID3:Composer',
+];
+
+// Audio tags that can be written, from exiftool's ID3 name to ffmpeg's metadata key.
+// exiftool cannot write MP3 files, so audio is written with ffmpeg.
+const AUDIO_TAGS = {
+  Title: 'title',
+  Artist: 'artist',
+  Album: 'album',
+  Band: 'album_artist',
+  Year: 'date',
+  Track: 'track',
+  Genre: 'genre',
+  Comment: 'comment',
+  Composer: 'composer',
+};
+
 // Fields that describe the file or are computed by exiftool. Shown, never written.
 const READ_ONLY_GROUPS = new Set(['File', 'Composite', 'ExifTool', 'System']);
 
@@ -54,18 +84,28 @@ const LIST_TAGS = new Set(['IPTC:Keywords', 'XMP-dc:Subject']);
 
 const KEY_PATTERN = /^[A-Za-z][A-Za-z0-9-]*:[A-Za-z0-9_-]+$/;
 
+const INSTALL_HINTS = {
+  exiftool: 'brew install exiftool',
+  ffmpeg: 'brew install ffmpeg',
+};
+
 function httpError(status, message) {
   return Object.assign(new Error(message), { status });
 }
 
-function run(args) {
+// Strips characters that would break the AppleScript string in a dialog prompt.
+function forAppleScript(text) {
+  return text.replace(/["\\]/g, '');
+}
+
+function execTool(tool, args, encoding = 'utf8') {
   return new Promise((resolve, reject) => {
-    execFile('exiftool', args, { maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile(tool, args, { maxBuffer: 32 * 1024 * 1024, encoding }, (err, stdout, stderr) => {
       if (err) {
         const message =
           err.code === 'ENOENT'
-            ? 'exiftool is not installed. Install it with: brew install exiftool'
-            : (stderr || err.message).trim();
+            ? `${tool} is not installed. Install it with: ${INSTALL_HINTS[tool]}`
+            : (String(stderr || '') || err.message).trim();
         return reject(httpError(500, message));
       }
       resolve(stdout);
@@ -73,9 +113,13 @@ function run(args) {
   });
 }
 
-function chooseFile() {
+function run(args) {
+  return execTool('exiftool', args);
+}
+
+function chooseFile(prompt) {
   return new Promise((resolve) => {
-    const script = 'POSIX path of (choose file with prompt "Choose a picture")';
+    const script = `POSIX path of (choose file with prompt "${forAppleScript(prompt)}")`;
     execFile('osascript', ['-e', script], (err, stdout) => {
       // Cancelling the dialog makes osascript fail; treat that as "no choice".
       resolve(err ? null : stdout.trim() || null);
@@ -83,9 +127,19 @@ function chooseFile() {
   });
 }
 
+// Opens the macOS save dialog. Resolves to the chosen path, or null if cancelled.
+function chooseSaveFile(defaultName) {
+  return new Promise((resolve) => {
+    const script = `POSIX path of (choose file name with prompt "Save as" default name "${forAppleScript(defaultName)}")`;
+    execFile('osascript', ['-e', script], (err, stdout) => {
+      resolve(err ? null : stdout.trim() || null);
+    });
+  });
+}
+
 function resolveFile(input) {
   if (typeof input !== 'string' || !input.trim()) {
-    throw httpError(400, 'Choose a picture first.');
+    throw httpError(400, 'Choose a file first.');
   }
   const file = path.resolve(input.trim().replace(/^~(?=$|\/)/, os.homedir()));
   let stat;
@@ -98,38 +152,57 @@ function resolveFile(input) {
   return file;
 }
 
-function buildFields(raw) {
+function kindOf(file) {
+  return AUDIO_EXTENSIONS.has(path.extname(file).toLowerCase()) ? 'audio' : 'image';
+}
+
+function isWritableAudio(group, tag) {
+  return /^ID3/.test(group) && Object.hasOwn(AUDIO_TAGS, tag);
+}
+
+function buildFields(raw, kind) {
+  const audio = kind === 'audio';
   const fields = [];
   const present = new Set();
+  const presentTags = new Set();
 
   for (const [key, value] of Object.entries(raw)) {
     if (key === 'SourceFile') continue;
     const colon = key.indexOf(':');
     const group = key.slice(0, colon);
+    const tag = key.slice(colon + 1);
+
+    // The cover image has its own controls, so it is not listed as a field.
+    if (audio && /^ID3v2_\d:Picture/.test(key)) continue;
+
     const isList = Array.isArray(value);
-    const readonly =
-      READ_ONLY_GROUPS.has(group) ||
-      (typeof value === 'object' && !isList) ||
-      String(value).startsWith('(Binary data');
+    const readonly = audio
+      ? !isWritableAudio(group, tag)
+      : READ_ONLY_GROUPS.has(group) ||
+        (typeof value === 'object' && !isList) ||
+        String(value).startsWith('(Binary data');
 
     fields.push({
       key,
       group,
-      tag: key.slice(colon + 1),
+      tag,
       value,
       type: isList || LIST_TAGS.has(key) ? 'list' : 'text',
       readonly,
     });
     present.add(key);
+    presentTags.add(tag);
   }
 
-  for (const key of COMMON_TAGS) {
-    if (present.has(key)) continue;
+  for (const key of audio ? AUDIO_COMMON_TAGS : COMMON_TAGS) {
     const colon = key.indexOf(':');
+    const tag = key.slice(colon + 1);
+    // For audio, skip a common tag when the same tag is already listed under another ID3 version.
+    if (present.has(key) || (audio && presentTags.has(tag))) continue;
     fields.push({
       key,
       group: key.slice(0, colon),
-      tag: key.slice(colon + 1),
+      tag,
       value: LIST_TAGS.has(key) ? [] : '',
       type: LIST_TAGS.has(key) ? 'list' : 'text',
       readonly: false,
@@ -142,18 +215,18 @@ function buildFields(raw) {
 async function readMetadata(file) {
   const stdout = await run(['-j', '-G1', '-a', '-charset', 'UTF8', file]);
   const [raw] = JSON.parse(stdout);
-  return { path: file, fileName: path.basename(file), fields: buildFields(raw) };
+  const kind = kindOf(file);
+  return {
+    path: file,
+    fileName: path.basename(file),
+    kind,
+    hasCover: kind === 'audio' && Object.keys(raw).some((key) => /^ID3v2_\d:Picture$/.test(key)),
+    fields: buildFields(raw, kind),
+  };
 }
 
-async function writeMetadata(file, changes) {
+async function writeImageMetadata(file, changes) {
   const args = ['-overwrite_original', '-charset', 'UTF8'];
-
-  // exiftool does not reliably replace an existing list when the clear and the
-  // new values are in one command, so clear list fields in a separate call first.
-  const listKeys = changes.filter(({ value }) => Array.isArray(value)).map(({ key }) => key);
-  if (listKeys.length > 0) {
-    await run(['-overwrite_original', '-charset', 'UTF8', ...listKeys.map((key) => `-${key}=`), file]);
-  }
 
   for (const { key, value } of changes) {
     if (typeof key !== 'string' || !KEY_PATTERN.test(key)) {
@@ -163,7 +236,7 @@ async function writeMetadata(file, changes) {
       throw httpError(400, `${key} is read-only.`);
     }
     if (Array.isArray(value)) {
-      // The list was cleared above, so the first value sets it and the rest are appended.
+      // The list was cleared earlier, so the first value sets it and the rest are appended.
       const [first, ...rest] = value.map(String);
       args.push(`-${key}=${first ?? ''}`);
       for (const item of rest) args.push(`-${key}+=${item}`);
@@ -173,9 +246,139 @@ async function writeMetadata(file, changes) {
     }
   }
 
+  if (changes.some(({ value }) => Array.isArray(value))) {
+    // exiftool does not reliably replace an existing list when the clear and the
+    // new values are in one command, so clear list fields in a separate call first.
+    const listKeys = changes.filter(({ value }) => Array.isArray(value)).map(({ key }) => key);
+    await run(['-overwrite_original', '-charset', 'UTF8', ...listKeys.map((key) => `-${key}=`), file]);
+  }
+
   if (args.length === 3) return;
   args.push(file);
   await run(args);
+}
+
+// exiftool cannot write MP3 files, so audio tags and the cover are written with ffmpeg.
+// The result goes to a temporary file that then replaces the original.
+// cover: undefined = keep, 'remove' = drop, { image } = use that JPEG or PNG.
+async function writeAudioMetadata(file, changes, cover) {
+  const tagArgs = [];
+  for (const { key, value } of changes) {
+    if (typeof key !== 'string' || !KEY_PATTERN.test(key)) {
+      throw httpError(400, `Invalid field name: ${key}`);
+    }
+    const colon = key.indexOf(':');
+    const group = key.slice(0, colon);
+    const tag = key.slice(colon + 1);
+    if (!isWritableAudio(group, tag)) throw httpError(400, `${key} is read-only.`);
+    tagArgs.push('-metadata', `${AUDIO_TAGS[tag]}=${String(value ?? '')}`);
+  }
+
+  if (tagArgs.length === 0 && cover === undefined) return;
+
+  const inputArgs = ['-i', file];
+  let mapArgs = ['-map', '0'];
+  const coverArgs = [];
+  if (cover === 'remove') {
+    mapArgs = ['-map', '0:a'];
+  } else if (cover) {
+    inputArgs.push('-i', cover.image);
+    mapArgs = ['-map', '0:a', '-map', '1:v'];
+    coverArgs.push('-metadata:s:v', 'title=Album cover', '-metadata:s:v', 'comment=Cover (front)');
+  }
+
+  const tmp = path.join(path.dirname(file), `.meta-tmp-${process.pid}-${Date.now()}.mp3`);
+  const args = [
+    '-y',
+    '-loglevel', 'error',
+    ...inputArgs,
+    ...mapArgs,
+    '-map_metadata', '0',
+    '-c', 'copy',
+    '-id3v2_version', '3',
+    ...tagArgs,
+    ...coverArgs,
+    '-f', 'mp3',
+    tmp,
+  ];
+
+  try {
+    await execTool('ffmpeg', args);
+    const { mode } = await fs.promises.stat(file);
+    await fs.promises.chmod(tmp, mode & 0o777);
+    await fs.promises.rename(tmp, file);
+  } catch (err) {
+    await fs.promises.rm(tmp, { force: true });
+    throw err;
+  }
+}
+
+function writeMetadata(file, changes, cover) {
+  return kindOf(file) === 'audio'
+    ? writeAudioMetadata(file, changes, cover)
+    : writeImageMetadata(file, changes);
+}
+
+// Reads the request's cover field: undefined = keep, null = remove, { image } = replace.
+function parseCover(value, file) {
+  if (value === undefined) return undefined;
+  if (kindOf(file) !== 'audio') throw httpError(400, 'Cover images can only be changed in audio files.');
+  if (value === null) return 'remove';
+  if (typeof value !== 'object' || typeof value.image !== 'string') {
+    throw httpError(400, 'Invalid cover image.');
+  }
+  const image = resolveFile(value.image);
+  if (!COVER_EXTENSIONS.has(path.extname(image).toLowerCase())) {
+    throw httpError(400, 'Cover images must be JPEG or PNG.');
+  }
+  return { image };
+}
+
+async function readCover(file) {
+  const data = await execTool('exiftool', ['-b', '-Picture', file], 'buffer');
+  if (data.length === 0) throw httpError(404, 'No cover image.');
+  return data;
+}
+
+function imageContentType(data) {
+  if (data[0] === 0xff && data[1] === 0xd8) return 'image/jpeg';
+  if (data.subarray(0, 4).toString('hex') === '89504e47') return 'image/png';
+  return 'application/octet-stream';
+}
+
+// Next free "<name>-clean<ext>", "<name>-clean-2<ext>", ... beside the original.
+function cleanCopyPath(file) {
+  const { dir, name, ext } = path.parse(file);
+  for (let n = 1; ; n++) {
+    const candidate = path.join(dir, n === 1 ? `${name}-clean${ext}` : `${name}-clean-${n}${ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+}
+
+async function saveCleanCopy(file) {
+  const dest = cleanCopyPath(file);
+  if (kindOf(file) === 'audio') {
+    // Drops every tag and the cover; the original is only read.
+    await execTool('ffmpeg', [
+      '-loglevel', 'error',
+      '-i', file,
+      '-map', '0:a',
+      '-map_metadata', '-1',
+      '-c', 'copy',
+      '-fflags', '+bitexact',
+      '-flags:a', '+bitexact',
+      '-f', 'mp3',
+      dest,
+    ]);
+  } else {
+    // "-o" writes to the new file and leaves the original untouched.
+    await run(['-all=', '-o', dest, file]);
+  }
+  return dest;
+}
+
+function changesFrom(body) {
+  return Array.isArray(body.changes) ? body.changes : [];
 }
 
 function readJson(req) {
@@ -231,15 +434,48 @@ const server = http.createServer(async (req, res) => {
       return await sendFile(res, file, contentType);
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/cover') {
+      const data = await readCover(resolveFile(url.searchParams.get('path')));
+      res.writeHead(200, { 'Content-Type': imageContentType(data), 'Cache-Control': 'no-store' });
+      return res.end(data);
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/save') {
       const body = await readJson(req);
       const file = resolveFile(body.path);
-      await writeMetadata(file, Array.isArray(body.changes) ? body.changes : []);
+      await writeMetadata(file, changesFrom(body), parseCover(body.cover, file));
       return sendJson(res, 200, await readMetadata(file));
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/save-clean') {
+      const body = await readJson(req);
+      const file = resolveFile(body.path);
+      return sendJson(res, 200, { path: await saveCleanCopy(file) });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/save-as') {
+      const body = await readJson(req);
+      const file = resolveFile(body.path);
+      const cover = parseCover(body.cover, file);
+      const dest = await chooseSaveFile(path.basename(file));
+      if (!dest) return sendJson(res, 200, { path: null });
+
+      // Saving over the original is an ordinary save. Anything else is a new copy,
+      // and existing files are never overwritten.
+      if (path.resolve(dest) !== file) {
+        if (fs.existsSync(dest)) {
+          throw httpError(409, `${path.basename(dest)} already exists. Choose another name.`);
+        }
+        await fs.promises.copyFile(file, dest);
+      }
+      await writeMetadata(dest, changesFrom(body), cover);
+      return sendJson(res, 200, await readMetadata(dest));
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/choose') {
-      return sendJson(res, 200, { path: await chooseFile() });
+      const body = await readJson(req);
+      const prompt = typeof body.prompt === 'string' ? body.prompt : 'Choose a file';
+      return sendJson(res, 200, { path: await chooseFile(prompt) });
     }
 
     sendJson(res, 404, { error: 'Not found' });

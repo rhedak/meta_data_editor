@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Metadata Editor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a72e8'/%3E%3Ctext x='16' y='23' font-family='Helvetica,Arial,sans-serif' font-size='22' font-weight='700' text-anchor='middle' fill='%23ffffff'%3Em%3C/text%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #f5f5f7;
@@ -92,6 +93,7 @@
     border: 1px solid var(--border);
     background: var(--panel);
   }
+  .cover-controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
   .filename { color: var(--muted); word-break: break-all; }
 
   .toolbar {
@@ -149,16 +151,21 @@
 <body>
 <header>
   <h1>Metadata Editor</h1>
-  <input id="path" type="text" placeholder="/path/to/picture.jpg" spellcheck="false">
+  <input id="path" type="text" placeholder="/path/to/file" spellcheck="false">
   <button id="open">Open</button>
-  <button id="choose">Choose picture…</button>
+  <button id="choose">Choose file…</button>
 </header>
 
-<p id="empty" class="muted" style="padding: 20px;">Choose a picture to see its metadata.</p>
+<p id="empty" class="muted" style="padding: 20px;">Choose a picture or audio file to see its metadata.</p>
 
 <main id="main" hidden>
   <aside>
-    <img id="preview" alt="Preview (not available for this format)">
+    <img id="preview" alt="Preview">
+    <p id="coverNote" class="muted" hidden></p>
+    <div id="coverControls" class="cover-controls" hidden>
+      <button id="chooseCover">Add cover…</button>
+      <button id="removeCover">Remove cover</button>
+    </div>
     <p id="fileName" class="filename"></p>
   </aside>
   <section>
@@ -166,7 +173,9 @@
       <label><input type="checkbox" id="hideEmpty" checked> Hide empty fields</label>
       <span id="status" class="status"></span>
       <span class="spacer"></span>
+      <button id="saveClean" title="Save a copy with all metadata removed. Your saved file is not changed.">Save clean copy</button>
       <button id="revert" disabled>Revert</button>
+      <button id="saveAs" title="Save a copy with your edits to a new file, chosen in the save dialog">Save as…</button>
       <button id="save" class="primary" disabled>Save</button>
     </div>
     <div id="groups"></div>
@@ -175,7 +184,8 @@
 
 <script>
   const $ = (selector) => document.querySelector(selector);
-  let state = null; // { path, fields: [{ key, group, tag, type, readonly, original, current, row }] }
+  // state.cover: undefined = unchanged, 'remove' = remove on save, { image } = replace with that file on save
+  let state = null; // { path, kind, hasCover, cover, fields: [{ key, group, tag, type, readonly, original, current, row }] }
 
   function el(tag, props = {}, ...children) {
     const node = Object.assign(document.createElement(tag), props);
@@ -204,9 +214,28 @@
     status.classList.toggle('error', isError);
   }
 
+  function unsavedCount() {
+    return state.fields.filter(isDirty).length + (state.cover === undefined ? 0 : 1);
+  }
+
+  function pendingChanges() {
+    return state.fields.filter(isDirty).map((field) => ({
+      key: field.key,
+      value: field.type === 'list' ? parseList(field.current) : field.current,
+    }));
+  }
+
+  // Edits sent to the server. A missing cover key means "leave the cover alone".
+  function pendingBody() {
+    return { changes: pendingChanges(), cover: state.cover === 'remove' ? null : state.cover };
+  }
+
   function setState(data) {
     state = {
       path: data.path,
+      kind: data.kind,
+      hasCover: data.hasCover,
+      cover: undefined,
       fields: data.fields.map((field) => {
         const text = toText(field.value);
         return { ...field, original: text, current: text, row: null };
@@ -214,10 +243,10 @@
     };
     $('#path').value = data.path;
     $('#fileName').textContent = data.fileName;
-    $('#preview').src = `/api/preview?path=${encodeURIComponent(data.path)}&t=${Date.now()}`;
     $('#main').hidden = false;
     $('#empty').hidden = true;
     render();
+    renderPreview();
   }
 
   function render() {
@@ -260,17 +289,56 @@
     return field.row;
   }
 
+  // Shows the cover area for audio files and what the cover will be after Save.
+  function renderPreview() {
+    const img = $('#preview');
+    const note = $('#coverNote');
+    const audio = state.kind === 'audio';
+    const hasCoverNow = state.cover === 'remove' ? false : state.cover ? true : state.hasCover;
+
+    $('#coverControls').hidden = !audio;
+    $('#chooseCover').textContent = hasCoverNow ? 'Replace cover…' : 'Add cover…';
+    $('#removeCover').disabled = !hasCoverNow;
+
+    let src = '';
+    let text = '';
+    if (!audio) {
+      src = `/api/preview?path=${encodeURIComponent(state.path)}`;
+    } else if (state.cover === 'remove') {
+      text = 'No cover image. It will be removed on Save.';
+    } else if (state.cover) {
+      src = `/api/preview?path=${encodeURIComponent(state.cover.image)}`;
+      text = 'New cover. It will be applied on Save.';
+    } else if (state.hasCover) {
+      src = `/api/cover?path=${encodeURIComponent(state.path)}`;
+    } else {
+      text = 'No cover image.';
+    }
+
+    img.onerror = () => {
+      img.hidden = true;
+      note.textContent = 'Preview not available for this image.';
+      note.hidden = false;
+    };
+    img.hidden = !src;
+    if (src) img.src = `${src}&t=${Date.now()}`;
+    note.textContent = text;
+    note.hidden = !text;
+  }
+
   function updateDirty() {
-    const changed = state.fields.filter(isDirty);
+    const count = unsavedCount();
     for (const field of state.fields) field.row?.classList.toggle('dirty', isDirty(field));
-    $('#save').disabled = changed.length === 0;
-    $('#revert').disabled = changed.length === 0;
-    setStatus(changed.length ? `${plural(changed.length, 'unsaved change')}` : '');
+    $('#save').disabled = count === 0;
+    $('#revert').disabled = count === 0;
+    // The clean copy is made from the saved file, so wait until edits are saved.
+    $('#saveClean').disabled = count > 0;
+    setStatus(count ? plural(count, 'unsaved change') : '');
   }
 
   async function open(path) {
-    if (!path) return setStatus('Enter a picture path or choose one.', true);
-    if (state?.fields.some(isDirty) && !confirm('Discard unsaved changes?')) return;
+    if (!path) return setStatus('Enter a file path or choose one.', true);
+    if (state && unsavedCount() > 0 && !confirm('Discard unsaved changes?')) return;
     try {
       setState(await api(`/api/file?path=${encodeURIComponent(path)}`));
     } catch (err) {
@@ -287,25 +355,67 @@
     }
   }
 
+  async function chooseCover() {
+    try {
+      const { path } = await api('/api/choose', { prompt: 'Choose a cover image' });
+      if (!path) return;
+      state.cover = { image: path };
+      renderPreview();
+      updateDirty();
+    } catch (err) {
+      setStatus(err.message, true);
+    }
+  }
+
+  function removeCover() {
+    state.cover = state.hasCover ? 'remove' : undefined;
+    renderPreview();
+    updateDirty();
+  }
+
   async function save() {
-    const changes = state.fields.filter(isDirty).map((field) => ({
-      key: field.key,
-      value: field.type === 'list' ? parseList(field.current) : field.current,
-    }));
-    if (changes.length === 0) return;
+    if (unsavedCount() === 0) return;
+    const parts = [];
+    const fieldCount = pendingChanges().length;
+    if (fieldCount) parts.push(plural(fieldCount, 'field'));
+    if (state.cover !== undefined) parts.push('cover image');
 
     try {
-      const data = await api('/api/save', { path: state.path, changes });
+      const data = await api('/api/save', { path: state.path, ...pendingBody() });
       setState(data);
-      setStatus(`Saved ${plural(changes.length, 'field')}.`);
+      setStatus(`Saved ${parts.join(' and ')}.`);
     } catch (err) {
       setStatus(`Save failed: ${err.message}`, true);
     }
   }
 
+  async function saveClean() {
+    try {
+      const { path } = await api('/api/save-clean', { path: state.path });
+      setStatus(`Clean copy saved as ${path}`);
+    } catch (err) {
+      setStatus(`Clean copy failed: ${err.message}`, true);
+    }
+  }
+
+  // Writes the current edits (saved or not) to a file chosen in the OS save dialog.
+  // The new file becomes the open file; the original is left as it was.
+  async function saveAs() {
+    try {
+      const data = await api('/api/save-as', { path: state.path, ...pendingBody() });
+      if (!data.path) return; // dialog cancelled
+      setState(data);
+      setStatus(`Saved as ${data.path}`);
+    } catch (err) {
+      setStatus(`Save as failed: ${err.message}`, true);
+    }
+  }
+
   function revert() {
+    state.cover = undefined;
     for (const field of state.fields) field.current = field.original;
     render();
+    renderPreview();
   }
 
   $('#open').addEventListener('click', () => open($('#path').value.trim()));
@@ -313,8 +423,12 @@
     if (event.key === 'Enter') open($('#path').value.trim());
   });
   $('#choose').addEventListener('click', choose);
+  $('#chooseCover').addEventListener('click', chooseCover);
+  $('#removeCover').addEventListener('click', removeCover);
   $('#hideEmpty').addEventListener('change', render);
   $('#save').addEventListener('click', save);
+  $('#saveClean').addEventListener('click', saveClean);
+  $('#saveAs').addEventListener('click', saveAs);
   $('#revert').addEventListener('click', revert);
   document.addEventListener('keydown', (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key === 's') {
@@ -323,7 +437,7 @@
     }
   });
   window.addEventListener('beforeunload', (event) => {
-    if (state?.fields.some(isDirty)) event.preventDefault();
+    if (state && unsavedCount() > 0) event.preventDefault();
   });
 </script>
 </body>
