@@ -1,0 +1,9 @@
+{
+  "name": "meta-data-editor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser-based metadata editor. Picture metadata first; needs exiftool installed.",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
