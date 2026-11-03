@@ -11,6 +11,12 @@ yarn-error.log*
 .env
 .env.*
 
+# Batch input and output: your files, not code. The folders stay, via .gitkeep.
+input/*
+out/*
+!input/.gitkeep
+!out/.gitkeep
+
 # Temporary files written by the server while saving MP3s
 .meta-tmp-*
 

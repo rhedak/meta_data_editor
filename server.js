@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
+const { kindOf, execTool, stripMetadata } = require('./lib/tools');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = '127.0.0.1';
@@ -16,7 +17,6 @@ const IMAGE_TYPES = {
   '.webp': 'image/webp',
 };
 
-const AUDIO_EXTENSIONS = new Set(['.mp3']);
 const COVER_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png']);
 
 // Fields offered for editing even when a picture does not have them yet.
@@ -84,11 +84,6 @@ const LIST_TAGS = new Set(['IPTC:Keywords', 'XMP-dc:Subject']);
 
 const KEY_PATTERN = /^[A-Za-z][A-Za-z0-9-]*:[A-Za-z0-9_-]+$/;
 
-const INSTALL_HINTS = {
-  exiftool: 'brew install exiftool',
-  ffmpeg: 'brew install ffmpeg',
-};
-
 function httpError(status, message) {
   return Object.assign(new Error(message), { status });
 }
@@ -96,21 +91,6 @@ function httpError(status, message) {
 // Strips characters that would break the AppleScript string in a dialog prompt.
 function forAppleScript(text) {
   return text.replace(/["\\]/g, '');
-}
-
-function execTool(tool, args, encoding = 'utf8') {
-  return new Promise((resolve, reject) => {
-    execFile(tool, args, { maxBuffer: 32 * 1024 * 1024, encoding }, (err, stdout, stderr) => {
-      if (err) {
-        const message =
-          err.code === 'ENOENT'
-            ? `${tool} is not installed. Install it with: ${INSTALL_HINTS[tool]}`
-            : (String(stderr || '') || err.message).trim();
-        return reject(httpError(500, message));
-      }
-      resolve(stdout);
-    });
-  });
 }
 
 function run(args) {
@@ -150,10 +130,6 @@ function resolveFile(input) {
   }
   if (!stat.isFile()) throw httpError(400, `Not a file: ${file}`);
   return file;
-}
-
-function kindOf(file) {
-  return AUDIO_EXTENSIONS.has(path.extname(file).toLowerCase()) ? 'audio' : 'image';
 }
 
 function isWritableAudio(group, tag) {
@@ -357,23 +333,7 @@ function cleanCopyPath(file) {
 
 async function saveCleanCopy(file) {
   const dest = cleanCopyPath(file);
-  if (kindOf(file) === 'audio') {
-    // Drops every tag and the cover; the original is only read.
-    await execTool('ffmpeg', [
-      '-loglevel', 'error',
-      '-i', file,
-      '-map', '0:a',
-      '-map_metadata', '-1',
-      '-c', 'copy',
-      '-fflags', '+bitexact',
-      '-flags:a', '+bitexact',
-      '-f', 'mp3',
-      dest,
-    ]);
-  } else {
-    // "-o" writes to the new file and leaves the original untouched.
-    await run(['-all=', '-o', dest, file]);
-  }
+  await stripMetadata(file, dest);
   return dest;
 }
 

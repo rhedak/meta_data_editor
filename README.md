@@ -20,6 +20,20 @@ npm start
 
 Then open http://localhost:3000 in your browser. Set a different port with `PORT=8080 npm start`.
 
+## Batch strip metadata
+
+To remove all metadata from many files at once, put them in `input/` (subfolders are fine), then run:
+
+```bash
+./strip.sh
+```
+
+Clean copies are written to `out/` with the same folder structure. The originals in `input/` are not changed, and existing files in `out/` are replaced. Files of other types are skipped. Supported types are JPEG, PNG, GIF, WebP, TIFF and MP3. Hidden files such as `.DS_Store` are ignored.
+
+Run it with other folders if you like: `./strip.sh path/to/in path/to/out`. The command exits with status 1 if any file fails. `npm run strip` does the same thing.
+
+Your files in `input/` and `out/` are git-ignored, so they will not be committed.
+
 ## Use
 
 1. Click **Choose picture…** (macOS file dialog) or paste a path and press Enter.

@@ -4,6 +4,7 @@
   "private": true,
   "description": "Browser-based metadata editor. Picture metadata first; needs exiftool installed.",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "strip": "node cli/strip.js"
   }
 }
